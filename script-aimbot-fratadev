@@ -1,0 +1,727 @@
+-- PrettyAimbotESP (Normal loader, sem botão de minimizar, com Team Check)
+-- Modificado por: luisfrata782-ui
+-- Alterações nesta versão:
+--  - Remove o modo de minimizar/restaurar da interface principal.
+--  - Adiciona botão "Team Check" na interface para habilitar/desabilitar checagem de time.
+--  - Mantive FOV via ScreenGui, sliders, ESP/highlight e aimbot.
+
+-- CONFIG PADRÃO (pode ser alterado via GUI)
+local teamCheck = false
+local fov = 80 -- raio do FOV em pixels (slider ajusta)
+local smoothing = 1.2
+local predictionFactor = 0.01
+local highlightEnabled = false
+local lockPart = "Head"
+local autoPredict = true
+
+local maxRange = 200
+
+local Toggle = false
+local ToggleKey = Enum.KeyCode.E
+
+-- SERVICES
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local StarterGui = game:GetService("StarterGui")
+local Players = game:GetService("Players")
+local TweenService = game:GetService("TweenService")
+local LocalPlayer = Players.LocalPlayer
+
+-- quick notification
+pcall(function()
+    StarterGui:SetCore("SendNotification", {
+        Title = "PrettyAimbotESP";
+        Text = "Script carregado. Insira a key para iniciar.";
+        Duration = 4;
+    })
+end)
+
+-- STATE
+local currentTarget = nil
+local aimbotEnabled = false
+local espEnabled = false
+local toggleState = false
+local highlights = {}
+
+local FOVGui = nil
+local FOVVisible = false
+
+local function clamp(v, a, b) return math.max(a, math.min(b, v)) end
+local function trim(s) return (tostring(s):gsub("^%s*(.-)%s*$", "%1")) end
+
+-- FOV GUI (ScreenGui circle)
+local function createFOVGui(parent)
+    if not parent then return nil end
+    local existing = parent:FindFirstChild("FRATA_FOV")
+    if existing then existing:Destroy() end
+
+    local screenGui = Instance.new("ScreenGui")
+    screenGui.Name = "FRATA_FOV"
+    screenGui.ResetOnSpawn = false
+    screenGui.Parent = parent
+
+    local ring = Instance.new("Frame")
+    ring.Name = "FOVRing"
+    ring.AnchorPoint = Vector2.new(0.5, 0.5)
+    ring.Size = UDim2.new(0, fov * 2, 0, fov * 2)
+    ring.Position = UDim2.new(0.5, 0, 0.5, 0)
+    ring.BackgroundTransparency = 1
+    ring.Parent = screenGui
+
+    local corner = Instance.new("UICorner", ring)
+    corner.CornerRadius = UDim.new(1, 0)
+
+    local stroke = Instance.new("UIStroke", ring)
+    stroke.Thickness = 3
+    stroke.Color = Color3.fromRGB(255, 128, 128)
+    stroke.LineJoinMode = Enum.LineJoinMode.Round
+
+    ring.Visible = FOVVisible
+
+    local function setRadius(px)
+        px = math.max(4, math.floor(px + 0.5))
+        ring.Size = UDim2.new(0, px * 2, 0, px * 2)
+        ring.Position = UDim2.new(0.5, 0, 0.5, 0)
+    end
+    local function setColor(col) if stroke then stroke.Color = col end end
+    local function setVisible(v) ring.Visible = not not v end
+
+    return { ScreenGui = screenGui, Ring = ring, SetRadius = setRadius, SetColor = setColor, SetVisible = setVisible }
+end
+
+-- Target validation
+local function isValidPlayerTarget(p)
+    if not p or p == LocalPlayer then return false end
+    if not p.Character then return false end
+    if not p.Character:FindFirstChild(lockPart) then return false end
+    if not p.Character:FindFirstChild("HumanoidRootPart") then return false end
+    if not p.Character:FindFirstChild("Humanoid") then return false end
+    if teamCheck and p.Team == LocalPlayer.Team then return false end
+    return true
+end
+
+local function predictPositionForPlayer(player)
+    if not player or not player.Character then return nil end
+    local char = player.Character
+    local part = char:FindFirstChild(lockPart)
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    if not part then return nil end
+    local pos = part.Position
+    if autoPredict and hrp then
+        local vel = hrp.Velocity or Vector3.new()
+        return pos + (vel * predictionFactor)
+    end
+    return pos
+end
+
+local function getClosestPlayer(cam)
+    local screenCenter = cam.ViewportSize / 2
+    local best = nil
+    local bestDist = math.huge
+    for _, p in ipairs(Players:GetPlayers()) do
+        if isValidPlayerTarget(p) then
+            local part = p.Character and p.Character:FindFirstChild(lockPart)
+            if part then
+                local screenPoint, onScreen = cam:WorldToViewportPoint(part.Position)
+                local distStuds = (part.Position - cam.CFrame.Position).Magnitude
+                if onScreen and distStuds <= maxRange then
+                    local d = (Vector2.new(screenPoint.X, screenPoint.Y) - screenCenter).Magnitude
+                    if d <= fov and d < bestDist then
+                        bestDist = d
+                        best = { instance = p, distance = distStuds }
+                    end
+                end
+            end
+        end
+    end
+    return best
+end
+
+-- Highlight management
+local function createHighlightForPlayer(p)
+    if not p or not p.Character then return end
+    if highlights[p] and highlights[p].Parent then return end
+    local ok, hl = pcall(function()
+        local h = Instance.new("Highlight")
+        h.Adornee = p.Character
+        h.FillTransparency = 0.6
+        h.FillColor = Color3.fromRGB(180, 40, 40)
+        h.OutlineColor = Color3.fromRGB(255, 80, 80)
+        h.Parent = workspace
+        return h
+    end)
+    if ok and hl then highlights[p] = hl end
+end
+local function removeHighlightForPlayer(p) if highlights[p] then highlights[p]:Destroy(); highlights[p] = nil end end
+local function setHighlightColorForPlayer(p, fillColor, outlineColor) if highlights[p] and highlights[p].Parent then highlights[p].FillColor = fillColor or highlights[p].FillColor; highlights[p].OutlineColor = outlineColor or highlights[p].OutlineColor end end
+
+local function enableESP()
+    espEnabled = true
+    highlightEnabled = true
+    for _, pl in ipairs(Players:GetPlayers()) do
+        if isValidPlayerTarget(pl) then
+            createHighlightForPlayer(pl)
+            setHighlightColorForPlayer(pl, Color3.fromRGB(180,40,40), Color3.fromRGB(255,80,80))
+        end
+    end
+end
+local function disableESP()
+    espEnabled = false
+    highlightEnabled = false
+    for p,_ in pairs(highlights) do removeHighlightForPlayer(p) end
+end
+
+Players.PlayerAdded:Connect(function(p)
+    p.CharacterAdded:Connect(function()
+        if espEnabled and isValidPlayerTarget(p) then
+            task.wait(0.05)
+            if espEnabled and isValidPlayerTarget(p) then createHighlightForPlayer(p) end
+        end
+    end)
+end)
+Players.PlayerRemoving:Connect(function(p) removeHighlightForPlayer(p) end)
+
+-- Toggle helper
+local localDebounce = false
+local function handleToggle()
+    if localDebounce then return end
+    localDebounce = true
+    toggleState = not toggleState
+    task.wait(0.15)
+    localDebounce = false
+end
+
+-- ========== Simple loader (normal) - 3 seconds ==========
+local function createLoaderGui(onComplete)
+    local player = LocalPlayer
+    if not player then return end
+    local playerGui = player:WaitForChild("PlayerGui")
+
+    local existing = playerGui:FindFirstChild("FRATA_Loader")
+    if existing then existing:Destroy() end
+
+    local screenGui = Instance.new("ScreenGui")
+    screenGui.Name = "FRATA_Loader"
+    screenGui.ResetOnSpawn = false
+    screenGui.Parent = playerGui
+
+    -- overlay
+    local overlay = Instance.new("Frame", screenGui)
+    overlay.Size = UDim2.new(1,0,1,0)
+    overlay.Position = UDim2.new(0,0,0,0)
+    overlay.BackgroundColor3 = Color3.fromRGB(0,0,0)
+    overlay.BackgroundTransparency = 0.25
+
+    -- panel
+    local panel = Instance.new("Frame", screenGui)
+    panel.Size = UDim2.new(0, 420, 0, 120)
+    panel.Position = UDim2.new(0.5, -210, 0.5, -60)
+    panel.BackgroundColor3 = Color3.fromRGB(18,18,20)
+    panel.BorderSizePixel = 0
+    local panelCorner = Instance.new("UICorner", panel); panelCorner.CornerRadius = UDim.new(0,8)
+    local panelStroke = Instance.new("UIStroke", panel); panelStroke.Color = Color3.fromRGB(40,40,45); panelStroke.Thickness = 1
+
+    local header = Instance.new("TextLabel", panel)
+    header.Size = UDim2.new(1, -24, 0, 24)
+    header.Position = UDim2.new(0, 12, 0, 12)
+    header.BackgroundTransparency = 1
+    header.Font = Enum.Font.GothamBold
+    header.TextSize = 16
+    header.TextColor3 = Color3.fromRGB(230,230,230)
+    header.Text = "Loading FRATA_DEV UI..."
+    header.TextXAlignment = Enum.TextXAlignment.Left
+
+    local loadingBarBack = Instance.new("Frame", panel)
+    loadingBarBack.Size = UDim2.new(1, -24, 0, 20)
+    loadingBarBack.Position = UDim2.new(0, 12, 1, -40)
+    loadingBarBack.BackgroundColor3 = Color3.fromRGB(28,28,30)
+    local lbCorner = Instance.new("UICorner", loadingBarBack); lbCorner.CornerRadius = UDim.new(0,6)
+    local loadingFill = Instance.new("Frame", loadingBarBack)
+    loadingFill.Size = UDim2.new(0,0,1,0)
+    loadingFill.BackgroundColor3 = Color3.fromRGB(110,60,200)
+    local fillCorner = Instance.new("UICorner", loadingFill); fillCorner.CornerRadius = UDim.new(0,6)
+
+    local status = Instance.new("TextLabel", panel)
+    status.Size = UDim2.new(1, -24, 0, 16)
+    status.Position = UDim2.new(0, 12, 1, -18)
+    status.BackgroundTransparency = 1
+    status.Font = Enum.Font.Gotham
+    status.TextSize = 12
+    status.TextColor3 = Color3.fromRGB(200,200,200)
+    status.Text = "Aguarde..."
+
+    -- animate over 3 seconds
+    spawn(function()
+        local total = 3
+        local start = tick()
+        while true do
+            local elapsed = tick() - start
+            local p = clamp(elapsed / total, 0, 1)
+            loadingFill.Size = UDim2.new(p, 0, 1, 0)
+            status.Text = string.format("Carregando... %d%%", math.floor(p * 100))
+            if p >= 1 then break end
+            task.wait(0.03)
+        end
+        task.wait(0.08)
+        if screenGui and screenGui.Parent then screenGui:Destroy() end
+        if onComplete then pcall(onComplete) end
+    end)
+end
+
+-- ========== MAIN GUI (sem minimizar; com Team Check) ==========
+local function createPrettyGui()
+    local player = LocalPlayer
+    if not player then return end
+    local playerGui = player:WaitForChild("PlayerGui")
+
+    -- cleanup old
+    local old = playerGui:FindFirstChild("PrettyAimbotESP")
+    if old then old:Destroy() end
+
+    -- recreate FOV GUI
+    FOVGui = createFOVGui(playerGui)
+    if FOVGui and FOVGui.SetRadius then FOVGui.SetRadius(fov) end
+    if FOVGui and FOVGui.SetVisible then FOVGui.SetVisible(FOVVisible) end
+
+    local screenGui = Instance.new("ScreenGui")
+    screenGui.Name = "PrettyAimbotESP"
+    screenGui.ResetOnSpawn = false
+    screenGui.Parent = playerGui
+
+    -- main frame
+    local frame = Instance.new("Frame", screenGui)
+    frame.Name = "MainFrame"
+    frame.Size = UDim2.new(0, 520, 0, 340)
+    frame.Position = UDim2.new(0, 18, 0, 18)
+    frame.BackgroundColor3 = Color3.fromRGB(10,10,12)
+    frame.BorderSizePixel = 0
+    local frameCorner = Instance.new("UICorner", frame); frameCorner.CornerRadius = UDim.new(0,12)
+    local frameStroke = Instance.new("UIStroke", frame); frameStroke.Color = Color3.fromRGB(30,30,35); frameStroke.Thickness = 1
+
+    -- top bar
+    local topBar = Instance.new("Frame", frame)
+    topBar.Size = UDim2.new(1, 0, 0, 64)
+    topBar.Position = UDim2.new(0,0,0,0)
+    topBar.BackgroundTransparency = 1
+
+    local title = Instance.new("TextLabel", topBar)
+    title.Size = UDim2.new(1, -36, 1, -6)
+    title.Position = UDim2.new(0, 18, 0, 6)
+    title.BackgroundTransparency = 1
+    title.Font = Enum.Font.GothamBold
+    title.TextSize = 20
+    title.TextColor3 = Color3.fromRGB(235,235,240)
+    title.Text = "▶ FRATA • Aimbot Suite"
+    title.TextXAlignment = Enum.TextXAlignment.Left
+
+    -- container for main content
+    local content = Instance.new("Frame", frame)
+    content.Name = "Content"
+    content.Size = UDim2.new(1, 0, 1, -72)
+    content.Position = UDim2.new(0, 0, 0, 68)
+    content.BackgroundTransparency = 1
+
+    -- left & right columns inside content
+    local left = Instance.new("Frame", content)
+    left.Size = UDim2.new(0, 240, 1, 0)
+    left.Position = UDim2.new(0, 18, 0, 0)
+    left.BackgroundTransparency = 1
+
+    local right = Instance.new("Frame", content)
+    right.Size = UDim2.new(0, 240, 1, 0)
+    right.Position = UDim2.new(0, 260, 0, 0)
+    right.BackgroundTransparency = 1
+
+    -- (Buttons & sliders)
+    local function fancyButton(parent, text, colorOn, colorOff, height)
+        local btn = Instance.new("TextButton", parent)
+        btn.Size = UDim2.new(1, 0, 0, height or 44)
+        btn.BackgroundColor3 = colorOff
+        btn.Font = Enum.Font.GothamBold
+        btn.TextSize = 14
+        btn.TextColor3 = Color3.fromRGB(18,18,20)
+        btn.Text = text
+        local corner = Instance.new("UICorner", btn); corner.CornerRadius = UDim.new(0,10)
+        local stroke = Instance.new("UIStroke", btn); stroke.Color = Color3.fromRGB(30,30,30); stroke.Thickness = 1
+        return btn
+    end
+
+    -- Aim button
+    local aimBtn = fancyButton(left, aimbotEnabled and "AIMBOT • ON" or "AIMBOT • OFF", Color3.fromRGB(50,200,120), Color3.fromRGB(80,80,90))
+    aimBtn.MouseButton1Click:Connect(function()
+        aimbotEnabled = not aimbotEnabled
+        aimBtn.Text = aimbotEnabled and "AIMBOT • ON" or "AIMBOT • OFF"
+        aimBtn.BackgroundColor3 = aimbotEnabled and Color3.fromRGB(50,200,120) or Color3.fromRGB(80,80,90)
+        if not aimbotEnabled then currentTarget = nil end
+    end)
+
+    -- ESP button
+    local espBtn = fancyButton(left, espEnabled and "ESP • ON" or "ESP • OFF", Color3.fromRGB(90,200,240), Color3.fromRGB(80,80,90))
+    espBtn.Position = UDim2.new(0,0,0,56)
+    espBtn.MouseButton1Click:Connect(function()
+        if espEnabled then
+            disableESP()
+            espBtn.Text = "ESP • OFF"
+            espBtn.BackgroundColor3 = Color3.fromRGB(80,80,90)
+        else
+            enableESP()
+            espBtn.Text = "ESP • ON"
+            espBtn.BackgroundColor3 = Color3.fromRGB(90,200,240)
+        end
+    end)
+
+    -- FOV toggle
+    local fovBtn = fancyButton(left, FOVVisible and "FOV • ON" or "FOV • OFF", Color3.fromRGB(110,60,200), Color3.fromRGB(80,80,90), 36)
+    fovBtn.Position = UDim2.new(0,0,0,116)
+    fovBtn.MouseButton1Click:Connect(function()
+        FOVVisible = not FOVVisible
+        if FOVGui and FOVGui.SetVisible then FOVGui.SetVisible(FOVVisible) end
+        fovBtn.Text = FOVVisible and "FOV • ON" or "FOV • OFF"
+        fovBtn.BackgroundColor3 = FOVVisible and Color3.fromRGB(110,60,200) or Color3.fromRGB(80,80,90)
+    end)
+
+    -- Team Check toggle (novo)
+    local teamBtn = fancyButton(left, teamCheck and "TEAM CHECK • ON" or "TEAM CHECK • OFF", Color3.fromRGB(240,180,60), Color3.fromRGB(80,80,90), 36)
+    teamBtn.Position = UDim2.new(0,0,0,156)
+    teamBtn.MouseButton1Click:Connect(function()
+        teamCheck = not teamCheck
+        teamBtn.Text = teamCheck and "TEAM CHECK • ON" or "TEAM CHECK • OFF"
+        teamBtn.BackgroundColor3 = teamCheck and Color3.fromRGB(240,180,60) or Color3.fromRGB(80,80,90)
+    end)
+
+    -- Target info
+    local targetInfo = Instance.new("TextLabel", left)
+    targetInfo.Size = UDim2.new(1, 0, 0, 36)
+    targetInfo.Position = UDim2.new(0, 0, 1, -44)
+    targetInfo.BackgroundTransparency = 1
+    targetInfo.Font = Enum.Font.GothamBold
+    targetInfo.TextSize = 14
+    targetInfo.TextColor3 = Color3.fromRGB(220,220,220)
+    targetInfo.Text = "Alvo: -  |  Dist: -"
+    targetInfo.TextWrapped = true
+    targetInfo.TextXAlignment = Enum.TextXAlignment.Left
+
+    -- Slider factory (returns container, set, get)
+    local function makeSlider(parent, labelText, minVal, maxVal, initialVal, fmt)
+        local container = Instance.new("Frame", parent)
+        container.Size = UDim2.new(1, 0, 0, 72)
+        container.BackgroundTransparency = 1
+
+        local label = Instance.new("TextLabel", container)
+        label.Size = UDim2.new(1, -68, 0, 20)
+        label.Position = UDim2.new(0, 0, 0, 0)
+        label.BackgroundTransparency = 1
+        label.Font = Enum.Font.Gotham
+        label.TextSize = 13
+        label.TextColor3 = Color3.fromRGB(220,220,220)
+        label.Text = labelText
+        label.TextXAlignment = Enum.TextXAlignment.Left
+
+        local valueLabel = Instance.new("TextLabel", container)
+        valueLabel.Size = UDim2.new(0, 56, 0, 20)
+        valueLabel.Position = UDim2.new(1, -56, 0, 0)
+        valueLabel.BackgroundTransparency = 1
+        valueLabel.Font = Enum.Font.GothamBold
+        valueLabel.TextSize = 13
+        valueLabel.TextColor3 = Color3.fromRGB(240,240,240)
+        valueLabel.Text = fmt(initialVal)
+        valueLabel.TextXAlignment = Enum.TextXAlignment.Right
+
+        local bar = Instance.new("Frame", container)
+        bar.Size = UDim2.new(1, 0, 0, 14)
+        bar.Position = UDim2.new(0,0,0,28)
+        bar.BackgroundColor3 = Color3.fromRGB(25,25,30)
+        local barCorner = Instance.new("UICorner", bar); barCorner.CornerRadius = UDim.new(0,7)
+        local barStroke = Instance.new("UIStroke", bar); barStroke.Color = Color3.fromRGB(40,40,45); barStroke.Thickness = 1
+
+        local fill = Instance.new("Frame", bar)
+        local percent = (initialVal - minVal) / (maxVal - minVal)
+        fill.Size = UDim2.new(percent, 0, 1, 0)
+        fill.BackgroundColor3 = Color3.fromRGB(110,60,200)
+        local fillCorner = Instance.new("UICorner", fill); fillCorner.CornerRadius = UDim.new(0,7)
+
+        local knob = Instance.new("ImageButton", bar)
+        knob.Size = UDim2.new(0, 18, 0, 18)
+        knob.Position = UDim2.new(percent, -9, 0.5, -9)
+        knob.BackgroundTransparency = 1
+        knob.Image = "rbxassetid://5997413875"
+
+        local dragging = false
+        local function updateFromInput(x)
+            local absPos = clamp(x - bar.AbsolutePosition.X, 0, bar.AbsoluteSize.X)
+            local p = (bar.AbsoluteSize.X > 0) and (absPos / bar.AbsoluteSize.X) or 0
+            fill:TweenSize(UDim2.new(p, 0, 1, 0), Enum.EasingDirection.Out, Enum.EasingStyle.Quad, 0.06, true)
+            knob:TweenPosition(UDim2.new(p, -9, 0.5, -9), Enum.EasingDirection.Out, Enum.EasingStyle.Quad, 0.06, true)
+            local val = minVal + p * (maxVal - minVal)
+            return val
+        end
+
+        bar.InputBegan:Connect(function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton1 then
+                dragging = true
+                local v = updateFromInput(input.Position.X)
+                valueLabel.Text = fmt(v)
+            end
+        end)
+        bar.InputEnded:Connect(function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton1 then dragging = false end
+        end)
+        UserInputService.InputChanged:Connect(function(input)
+            if dragging and input.UserInputType == Enum.UserInputType.MouseMovement then
+                local v = updateFromInput(input.Position.X)
+                valueLabel.Text = fmt(v)
+            end
+        end)
+
+        local function setValue(v)
+            v = clamp(v, minVal, maxVal)
+            local p = (v - minVal) / (maxVal - minVal)
+            fill.Size = UDim2.new(p, 0, 1, 0)
+            knob.Position = UDim2.new(p, -9, 0.5, -9)
+            valueLabel.Text = fmt(v)
+        end
+        local function getValue()
+            local txt = tostring(valueLabel.Text)
+            local n = tonumber(txt)
+            if not n then n = tonumber((txt:gsub("%D",""))) or initialVal end
+            return n
+        end
+
+        return container, setValue, getValue
+    end
+
+    -- sliders
+    local fovContainer, setFOVSlider, getFOVSlider = makeSlider(right, "FOV (px)", 20, 1000, fov, function(v) return tostring(math.floor(v + 0.5)) end)
+    fovContainer.Position = UDim2.new(0,0,0,0)
+    local smoothContainer, setSmoothSlider, getSmoothSlider = makeSlider(right, "Smoothing", 0.05, 5, smoothing, function(v) return string.format("%.2f", v) end)
+    smoothContainer.Position = UDim2.new(0,0,0,84)
+    local rangeContainer, setRangeSlider, getRangeSlider = makeSlider(right, "Max Range (studs)", 20, 2000, maxRange, function(v) return tostring(math.floor(v + 0.5)) end)
+    rangeContainer.Position = UDim2.new(0,0,0,168)
+
+    -- update sliders
+    RunService:BindToRenderStep("PrettyGUI_UpdateSliders", Enum.RenderPriority.Input.Value + 1, function()
+        local num = tonumber(getFOVSlider() or fov) or fov
+        num = clamp(math.floor(num + 0.5), 20, 1000)
+        if num ~= fov then
+            fov = num
+            if FOVGui and FOVGui.SetRadius then FOVGui.SetRadius(fov) end
+        end
+        local sv = tonumber(getSmoothSlider() or smoothing)
+        if sv then smoothing = clamp(sv, 0.05, 5) end
+        local rv = tonumber(getRangeSlider() or maxRange)
+        if rv then maxRange = clamp(math.floor(rv + 0.5), 20, 2000) end
+    end)
+
+    -- expose TargetInfo to update externally
+    return {
+        ScreenGui = screenGui,
+        Frame = frame,
+        TargetInfo = targetInfo,
+        SetFOVSlider = setFOVSlider,
+        SetSmoothSlider = setSmoothSlider,
+        SetRangeSlider = setRangeSlider,
+    }
+end
+
+-- ========== Loader input + start ==========
+local function createLoaderAndStart()
+    local player = LocalPlayer
+    if not player then return end
+    local playerGui = player:WaitForChild("PlayerGui")
+
+    -- remove existing
+    local existing = playerGui:FindFirstChild("FRATA_Loader_Input")
+    if existing then existing:Destroy() end
+
+    local sg = Instance.new("ScreenGui")
+    sg.Name = "FRATA_Loader_Input"
+    sg.ResetOnSpawn = false
+    sg.Parent = playerGui
+
+    local panel = Instance.new("Frame", sg)
+    panel.Size = UDim2.new(0, 420, 0, 140)
+    panel.Position = UDim2.new(0.5, -210, 0.5, -70)
+    panel.BackgroundColor3 = Color3.fromRGB(18,18,20)
+    local corner = Instance.new("UICorner", panel); corner.CornerRadius = UDim.new(0,8)
+    local stroke = Instance.new("UIStroke", panel); stroke.Color = Color3.fromRGB(40,40,45); stroke.Thickness = 1
+
+    local header = Instance.new("TextLabel", panel)
+    header.Size = UDim2.new(1, -24, 0, 28)
+    header.Position = UDim2.new(0, 12, 0, 8)
+    header.BackgroundTransparency = 1
+    header.Font = Enum.Font.GothamBold
+    header.TextSize = 16
+    header.TextColor3 = Color3.fromRGB(230,230,230)
+    header.Text = "Unlock FRATA_DEV UI"
+
+    local input = Instance.new("TextBox", panel)
+    input.Size = UDim2.new(1, -24, 0, 36)
+    input.Position = UDim2.new(0, 12, 0, 44)
+    input.BackgroundColor3 = Color3.fromRGB(28,28,30)
+    input.TextColor3 = Color3.fromRGB(230,230,230)
+    input.Font = Enum.Font.Gotham
+    input.PlaceholderText = "Digite a key aqui..."
+    local inCorner = Instance.new("UICorner", input); inCorner.CornerRadius = UDim.new(0,6)
+
+    local unlockBtn = Instance.new("TextButton", panel)
+    unlockBtn.Size = UDim2.new(0, 120, 0, 32)
+    unlockBtn.Position = UDim2.new(1, -132, 0, 44)
+    unlockBtn.BackgroundColor3 = Color3.fromRGB(90,160,220)
+    unlockBtn.Text = "Unlock"
+    unlockBtn.Font = Enum.Font.GothamBold
+    local ubCorner = Instance.new("UICorner", unlockBtn); ubCorner.CornerRadius = UDim.new(0,6)
+
+    local status = Instance.new("TextLabel", panel)
+    status.Size = UDim2.new(1, -24, 0, 16)
+    status.Position = UDim2.new(0, 12, 1, -24)
+    status.BackgroundTransparency = 1
+    status.Font = Enum.Font.Gotham
+    status.TextSize = 12
+    status.TextColor3 = Color3.fromRGB(200,200,200)
+    status.Text = ""
+
+    local loadingBarBack = Instance.new("Frame", panel)
+    loadingBarBack.Size = UDim2.new(1, -24, 0, 12)
+    loadingBarBack.Position = UDim2.new(0, 12, 1, -44)
+    loadingBarBack.BackgroundColor3 = Color3.fromRGB(28,28,30)
+    loadingBarBack.Visible = false
+    local lbCorner2 = Instance.new("UICorner", loadingBarBack); lbCorner2.CornerRadius = UDim.new(0,6)
+    local loadingFill = Instance.new("Frame", loadingBarBack)
+    loadingFill.Size = UDim2.new(0,0,1,0)
+    loadingFill.BackgroundColor3 = Color3.fromRGB(110,60,200)
+    local fillCorner2 = Instance.new("UICorner", loadingFill); fillCorner2.CornerRadius = UDim.new(0,6)
+
+    local SECRET_KEY = "FRATA IS GOOD"
+
+    local function startLoading()
+        input.Visible = false
+        unlockBtn.Visible = false
+        status.Text = "Carregando... aguarde 3 segundos"
+        loadingBarBack.Visible = true
+
+        local total = 3
+        local start = tick()
+        spawn(function()
+            while true do
+                local elapsed = tick() - start
+                local p = clamp(elapsed / total, 0, 1)
+                loadingFill.Size = UDim2.new(p, 0, 1, 0)
+                if p >= 1 then break end
+                task.wait(0.03)
+            end
+            task.wait(0.08)
+            if sg and sg.Parent then sg:Destroy() end
+            -- create main GUI
+            local mainGuiRef = createPrettyGui()
+            if mainGuiRef and mainGuiRef.SetFOVSlider then mainGuiRef.SetFOVSlider(fov) end
+            if mainGuiRef and mainGuiRef.SetSmoothSlider then mainGuiRef.SetSmoothSlider(smoothing) end
+            if mainGuiRef and mainGuiRef.SetRangeSlider then mainGuiRef.SetRangeSlider(maxRange) end
+        end)
+    end
+
+    local function attemptUnlock()
+        local entry = trim(input.Text or "")
+        if string.lower(entry) == string.lower(SECRET_KEY) then
+            status.Text = "Key aceita. Inicializando..."
+            startLoading()
+        else
+            status.Text = "Key inválida. Tente novamente."
+            local origin = panel.Position
+            for i = 1,6 do
+                panel:TweenPosition(origin + UDim2.new(0, (i%2==0 and -6 or 6), 0, 0), Enum.EasingDirection.Out, Enum.EasingStyle.Quad, 0.04, true)
+                task.wait(0.04)
+            end
+            panel:TweenPosition(origin, Enum.EasingDirection.Out, Enum.EasingStyle.Quad, 0.06, true)
+        end
+    end
+
+    unlockBtn.MouseButton1Click:Connect(attemptUnlock)
+    input.FocusLost:Connect(function(enterPressed) if enterPressed then attemptUnlock() end end)
+end
+
+-- start
+createLoaderAndStart()
+
+-- MAIN LOOP
+RunService.RenderStepped:Connect(function()
+    local cam = workspace.CurrentCamera
+    if not cam then return end
+
+    -- input state (hold right mouse)
+    if Toggle then
+        if UserInputService:IsKeyDown(ToggleKey) then handleToggle() end
+    else
+        toggleState = UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2)
+    end
+
+    -- sync ESP highlights
+    if espEnabled then
+        for _, p in ipairs(Players:GetPlayers()) do
+            if isValidPlayerTarget(p) then
+                createHighlightForPlayer(p)
+                if not (currentTarget and currentTarget.instance == p and toggleState) then
+                    setHighlightColorForPlayer(p, Color3.fromRGB(180,40,40), Color3.fromRGB(255,80,80))
+                end
+            else
+                removeHighlightForPlayer(p)
+            end
+        end
+    end
+
+    if toggleState then
+        local candidate = getClosestPlayer(cam)
+        if candidate then currentTarget = candidate else currentTarget = nil end
+
+        -- update target info if GUI present
+        local playerGui = LocalPlayer and LocalPlayer:FindFirstChild("PlayerGui")
+        if playerGui then
+            local screenGui = playerGui:FindFirstChild("PrettyAimbotESP")
+            if screenGui and screenGui:FindFirstChild("MainFrame") then
+                local mainFrame = screenGui.MainFrame
+                local content = mainFrame:FindFirstChild("Content")
+                if content then
+                    local targetInfo = content:FindFirstChildWhichIsA("TextLabel", true)
+                    -- We already have mainGui returning reference; for safety we update the first matching label
+                end
+            end
+        end
+
+        if currentTarget and currentTarget.instance then
+            if espEnabled then
+                for p,_ in pairs(highlights) do
+                    if p == currentTarget.instance then
+                        setHighlightColorForPlayer(p, Color3.fromRGB(34,220,110), Color3.fromRGB(120,255,180))
+                    else
+                        setHighlightColorForPlayer(p, Color3.fromRGB(180,40,40), Color3.fromRGB(255,80,80))
+                    end
+                end
+            else
+                for p,_ in pairs(highlights) do removeHighlightForPlayer(p) end
+                if highlightEnabled then
+                    createHighlightForPlayer(currentTarget.instance)
+                    setHighlightColorForPlayer(currentTarget.instance, Color3.fromRGB(34,220,110), Color3.fromRGB(120,255,180))
+                end
+            end
+
+            if aimbotEnabled then
+                local predicted = predictPositionForPlayer(currentTarget.instance)
+                if predicted then
+                    workspace.CurrentCamera.CFrame = workspace.CurrentCamera.CFrame:Lerp(CFrame.new(cam.CFrame.Position, predicted), smoothing)
+                end
+            end
+
+            if FOVGui and FOVGui.SetColor then FOVGui.SetColor(Color3.fromRGB(0,230,120)) end
+        else
+            if FOVGui and FOVGui.SetColor then FOVGui.SetColor(Color3.fromRGB(255,128,128)) end
+        end
+    else
+        if espEnabled then
+            for p,_ in pairs(highlights) do setHighlightColorForPlayer(p, Color3.fromRGB(180,40,40), Color3.fromRGB(255,80,80)) end
+        else
+            for p,_ in pairs(highlights) do removeHighlightForPlayer(p) end
+        end
+        if FOVGui and FOVGui.SetColor then FOVGui.SetColor(Color3.fromRGB(255,128,128)) end
+    end
+end)
+
+-- FIM
